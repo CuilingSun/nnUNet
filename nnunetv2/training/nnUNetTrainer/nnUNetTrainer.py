@@ -143,6 +143,13 @@ class nnUNetTrainer(object):
 
         ### Some hyperparameters for you to fiddle with
         self.initial_lr = 1e-2
+        # allow overriding LR via env for quick stabilization when needed
+        try:
+            _lr_env = os.environ.get('NNUNET_LR', '').strip()
+            if _lr_env:
+                self.initial_lr = float(_lr_env)
+        except Exception:
+            pass
         self.weight_decay = 3e-5
         self.oversample_foreground_percent = 0.33
         self.probabilistic_oversampling = False
@@ -160,7 +167,13 @@ class nnUNetTrainer(object):
         self.num_input_channels = None  # -> self.initialize()
         self.network = None  # -> self.build_network_architecture()
         self.optimizer = self.lr_scheduler = None  # -> self.initialize
-        self.grad_scaler = GradScaler("cuda") if self.device.type == 'cuda' else None
+        # mixed precision can occasionally destabilize custom models; allow opt-out via env
+        try:
+            _disable_amp = str(os.environ.get('NNUNET_DISABLE_AMP', '0')).lower() in ('1', 'true', 'yes', 'y')
+        except Exception:
+            _disable_amp = False
+        self.use_amp = (self.device.type == 'cuda') and (not _disable_amp)
+        self.grad_scaler = GradScaler("cuda") if self.use_amp else None
         self.loss = None  # -> self.initialize
 
         ### Simple logging. Don't take that away from me!
@@ -985,10 +998,17 @@ class nnUNetTrainer(object):
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
-        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+        with (autocast(self.device.type, enabled=True) if (self.device.type == 'cuda' and self.use_amp) else dummy_context()):
             output = self.network(data)
             # del data
             l = self.loss(output, target)
+
+        # Guard: skip optimizer step on non-finite loss to avoid poisoning training
+        if not torch.isfinite(l):
+            self.print_to_log_file('WARNING: non-finite loss detected; skipping optimizer step this iteration')
+            self.optimizer.zero_grad(set_to_none=True)
+            # return a finite placeholder to keep logging stable
+            return {'loss': float(0.0)}
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
@@ -1000,7 +1020,8 @@ class nnUNetTrainer(object):
             l.backward()
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
-        return {'loss': l.detach().cpu().numpy()}
+        # return a Python float to simplify downstream collation
+        return {'loss': float(l.detach().cpu().item())}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
         outputs = collate_outputs(train_outputs)
@@ -1031,7 +1052,7 @@ class nnUNetTrainer(object):
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
-        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+        with (autocast(self.device.type, enabled=True) if (self.device.type == 'cuda' and self.use_amp) else dummy_context()):
             output = self.network(data)
             del data
             l = self.loss(output, target)
@@ -1082,7 +1103,7 @@ class nnUNetTrainer(object):
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
 
-        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
+        return {'loss': float(l.detach().cpu().item()), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
 
     def on_validation_epoch_end(self, val_outputs: List[dict]):
         outputs_collated = collate_outputs(val_outputs)

@@ -199,14 +199,74 @@ class nnUNetDataLoader(DataLoader):
         if self.transforms is not None:
             with torch.no_grad():
                 with threadpool_limits(limits=1, user_api=None):
-                    data_all = torch.from_numpy(data_all).float()
-                    seg_all = torch.from_numpy(seg_all).to(torch.int16)
+                    # data_all = torch.from_numpy(data_all).float()
+                    data_all = np.ascontiguousarray(data_all, dtype=np.float32)
+
+                    # seg_all = torch.from_numpy(seg_all).to(torch.int16)
+                    seg_all = np.asarray(seg_all)
+                    if seg_all.dtype == np.object_:
+                        try:
+                            seg_all = np.stack([np.asarray(e) for e in seg_all], axis=0)
+                        except Exception:
+                            seg_all = np.asarray(seg_all.tolist())
+                    if seg_all.ndim == 0:
+                        seg_all = seg_all[None]
+                    seg_all = np.ascontiguousarray(seg_all)
+                    if not np.issubdtype(seg_all.dtype, np.integer):
+                        seg_all = seg_all.astype(np.int16, copy=False)
+
                     images = []
                     segs = []
+                    
+                    def _to_torch_image(x):
+                        if torch.is_tensor(x):
+                            return x.contiguous().to(torch.float32)
+                        x = np.ascontiguousarray(x, dtype=np.float32)
+                        return torch.from_numpy(x)
+
+                    def _to_torch_label(x):
+                        if torch.is_tensor(x):
+                            return x.contiguous()
+                        x = np.asarray(x)
+                        if x.dtype == np.object_:
+                            try:
+                                x = np.stack([np.asarray(e) for e in x], axis=0)
+                            except Exception:
+                                x = np.asarray(x.tolist())
+                        if x.ndim == 0:
+                            x = x[None]
+                        x = np.ascontiguousarray(x)
+                        if not np.issubdtype(x.dtype, np.integer):
+                            x = x.astype(np.int16, copy=False)
+                        return torch.from_numpy(x)
+
                     for b in range(self.batch_size):
-                        tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_all[b]})
-                        images.append(tmp['image'])
-                        segs.append(tmp['segmentation'])
+                        # Prepare per-sample torch tensors for transforms
+                        img_np = np.ascontiguousarray(data_all[b], dtype=np.float32)
+                        img_t = torch.as_tensor(img_np, dtype=torch.float32)
+
+                        seg_np = seg_all[b]
+                        seg_np = np.asarray(seg_np)
+                        if seg_np.dtype == np.object_:
+                            try:
+                                seg_np = np.stack([np.asarray(e) for e in seg_np], axis=0)
+                            except Exception:
+                                seg_np = np.asarray(seg_np.tolist())
+                        if seg_np.ndim == 0:
+                            seg_np = seg_np[None]
+                        seg_np = np.ascontiguousarray(seg_np)
+                        if not np.issubdtype(seg_np.dtype, np.integer):
+                            seg_np = seg_np.astype(np.int16, copy=False)
+                        seg_t = torch.as_tensor(seg_np, dtype=torch.int16)
+
+                        tmp = self.transforms(**{'image': img_t, 'segmentation': seg_t})
+
+                        images.append(_to_torch_image(tmp['image']))
+                        seg_out = tmp['segmentation']
+                        if isinstance(seg_out, list):
+                            segs.append([_to_torch_label(s) for s in seg_out])
+                        else:
+                            segs.append(_to_torch_label(seg_out))
                     data_all = torch.stack(images)
                     if isinstance(segs[0], list):
                         seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs[0]))]

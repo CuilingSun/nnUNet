@@ -25,6 +25,10 @@ class TopKLoss(RobustCrossEntropyLoss):
         super(TopKLoss, self).__init__(weight, False, ignore_index, reduce=False, label_smoothing=label_smoothing)
 
     def forward(self, inp, target):
+        # Ensure class weights live on the same device as inputs (important for CUDA)
+        if getattr(self, 'weight', None) is not None:
+            if self.weight.device != inp.device:
+                self.weight = self.weight.to(inp.device)
         target = target[:, 0].long()
         res = super(TopKLoss, self).forward(inp, target)
         num_voxels = np.prod(res.shape, dtype=np.int64)

@@ -114,3 +114,10 @@ ENV/
 *.model
 
 !documentation/assets/scribble_example.png
+
+# Local outputs (do not commit)
+features_a1_biomedclip/
+out_heatmap_grid_gate/
+
+# Training logs (do not commit)
+log/
