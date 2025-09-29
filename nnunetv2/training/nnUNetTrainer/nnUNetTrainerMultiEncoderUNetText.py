@@ -1,5 +1,5 @@
 import os
-from typing import List, Union
+from typing import List, Optional, Union
 
 import numpy as np
 import torch
@@ -40,6 +40,16 @@ class nnUNetTrainerMultiEncoderUNetText(nnUNetTrainerMultiEncoderUNet):
 
     def initialize(self):
         super().initialize()
+        # Optionally load a pretrained encoder (image branch only) from a checkpoint.
+        # Triggered by env var NNUNET_ENCODER_PRETRAIN pointing to a .pth file.
+        # Supports:
+        #  - Same-arch MultiEncoderUNet checkpoints (encoders.0.* keys)
+        #  - Plain single-encoder nnUNet-style checkpoints with 'encoder.*' keys
+        #  - Safe shape filtering with first-conv in_channels adaptation (e.g., >1 -> 1 via mean)
+        try:
+            self._maybe_load_image_encoder_pretrain()
+        except Exception as e:
+            self.print_to_log_file(f"[WARN] Encoder pretrain loading skipped due to error: {e}")
         # Optional runtime overrides to ease debugging/perf tuning
         try:
             bs = os.environ.get('NNUNET_BATCH_SIZE', '').strip()
@@ -78,6 +88,10 @@ class nnUNetTrainerMultiEncoderUNetText(nnUNetTrainerMultiEncoderUNet):
                 self.num_val_iterations_per_epoch = int(os.environ['NNUNET_VAL_ITERS'])
         except Exception:
             pass
+        self._global_iteration = 0
+        self._epoch_iteration = 0
+        self._aux_epoch_stats = []
+        self._last_aux_stats = None
 
     def _ensure_text_for_modulation(self):
         """
@@ -102,6 +116,120 @@ class nnUNetTrainerMultiEncoderUNetText(nnUNetTrainerMultiEncoderUNet):
         except Exception:
             # silently skip if anything unexpected happens
             pass
+
+    
+
+    def _maybe_load_image_encoder_pretrain(self):
+        """
+        Load pretrained weights for the image encoder only from a given checkpoint.
+        Activate by setting env NNUNET_ENCODER_PRETRAIN to a .pth path.
+
+        Supports two common layouts:
+          - MultiEncoderUNet/Multi-branch: keys like 'encoders.0.*' (direct filter)
+          - Plain single-encoder nnUNet:  keys like 'encoder.*' mapped to 'encoders.0.*'
+
+        Safety:
+          - Skip segmentation heads and unrelated modules
+          - Filter by exact shape; adapt first conv in_channels: N->1 via mean across channel dim
+          - Strict=False load so non-matching keys are ignored
+        """
+        import os
+        import torch
+        from torch.nn.parallel import DistributedDataParallel as DDP
+
+        ckpt_path = os.environ.get('NNUNET_ENCODER_PRETRAIN', '').strip()
+        if not ckpt_path or not os.path.isfile(ckpt_path):
+            return
+
+        try:
+            try:
+                saved = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+            except TypeError:
+                # PyTorch <2.4 doesn't support weights_only kwarg
+                saved = torch.load(ckpt_path, map_location='cpu')
+        except Exception as e:
+            self.print_to_log_file(f"[Encoder-Pretrain] Failed to load checkpoint: {e}")
+            return
+
+        state = saved.get('network_weights') or saved.get('state_dict') or saved
+        net = self.network.module if isinstance(self.network, DDP) else self.network
+        target_sd = net.state_dict()
+
+        def _is_seg_or_head(k: str) -> bool:
+            return ('.seg_layers.' in k) or k.endswith('.seg_layers') or ('final_conv' in k) or ('output_block' in k)
+
+        src_keys = list(state.keys())
+        has_multi = any(k.startswith('encoders.0.') for k in src_keys)
+        has_plain = any(k.startswith('encoder.') for k in src_keys)
+
+        mapped = {}
+        if has_multi:
+            for k, v in state.items():
+                if not k.startswith('encoders.0.') or _is_seg_or_head(k):
+                    continue
+                if k in target_sd and target_sd[k].shape == v.shape:
+                    mapped[k] = v
+        elif has_plain:
+            for k, v in state.items():
+                if not k.startswith('encoder.') or _is_seg_or_head(k):
+                    continue
+                tk = 'encoders.0.' + k[len('encoder.'):]
+                if tk in target_sd:
+                    tv = v
+                    # first conv adaptation: collapse in_channels to 1 via mean if needed
+                    if (
+                        isinstance(tv, torch.Tensor)
+                        and isinstance(target_sd[tk], torch.Tensor)
+                        and tv.ndim >= 3 and target_sd[tk].ndim == tv.ndim
+                        and tv.shape[0] == target_sd[tk].shape[0]
+                        and tv.shape[2:] == target_sd[tk].shape[2:]
+                        and target_sd[tk].shape[1] == 1 and tv.shape[1] != 1
+                    ):
+                        tv = tv.mean(dim=1, keepdim=True)
+                    if target_sd[tk].shape == tv.shape:
+                        mapped[tk] = tv
+        else:
+            # Fallback: try best-effort shape-based matching for encoders.0.* keys
+            for tk, tv in target_sd.items():
+                if not tk.startswith('encoders.0.') or _is_seg_or_head(tk):
+                    continue
+                if tk in state and isinstance(state[tk], torch.Tensor) and state[tk].shape == tv.shape:
+                    mapped[tk] = state[tk]
+                    continue
+                # Single pass: find a same-shape tensor not obviously a head
+                for sk, sv in state.items():
+                    if _is_seg_or_head(sk):
+                        continue
+                    if isinstance(sv, torch.Tensor) and sv.shape == tv.shape:
+                        mapped[tk] = sv
+                        break
+
+        # Optional: copy encoder 0 weights to all encoders if shapes match
+        copy_all = str(os.environ.get('NNUNET_COPY_PRETRAIN_TO_ALL_ENCODERS', '0')).lower() in ('1', 'true', 'yes', 'y')
+        if copy_all:
+            try:
+                num_enc = len(getattr(net, 'encoders', []))
+            except Exception:
+                num_enc = 1
+            if num_enc > 1:
+                extra = {}
+                for i in range(1, num_enc):
+                    for k, v in mapped.items():
+                        if not k.startswith('encoders.0.'):
+                            continue
+                        kk = k.replace('encoders.0.', f'encoders.{i}.', 1)
+                        if kk in target_sd and target_sd[kk].shape == v.shape:
+                            extra[kk] = v
+                mapped.update(extra)
+
+        res = net.load_state_dict(mapped, strict=False)
+        try:
+            miss_ct = len(getattr(res, 'missing_keys', []))
+            unexp_ct = len(getattr(res, 'unexpected_keys', []))
+        except Exception:
+            miss_ct = unexp_ct = 0
+        self.print_to_log_file(f"[Encoder-Pretrain] from={ckpt_path}")
+        self.print_to_log_file(f"[Encoder-Pretrain] loaded_params={len(mapped)} missing={miss_ct} unexpected={unexp_ct}")
 
     def _build_loss(self):
         """Build primary segmentation loss with optional Text-variant selection.
@@ -264,9 +392,37 @@ class nnUNetTrainerMultiEncoderUNetText(nnUNetTrainerMultiEncoderUNet):
                 self.text_embed = self.text_embed @ w
             self.text_embed = self.text_embed.to(self.device)
 
+    def _update_aux_logging(self, stats: Optional[dict] = None) -> None:
+        base_scale = float(getattr(self, '_aux_scale', 1.0))
+        defaults = {
+            'total': 0.0,
+            'align_contrib': 0.0,
+            'heat_contrib': 0.0,
+            'align_raw': 0.0,
+            'heat_raw': 0.0,
+            'scale': base_scale,
+            'align_weight': float(self.lambda_align),
+            'heat_weight': float(self.lambda_heat),
+            'align_weight_scaled': float(self.lambda_align * base_scale),
+            'heat_weight_scaled': float(self.lambda_heat * base_scale),
+        }
+        if stats:
+            for key, value in stats.items():
+                try:
+                    defaults[key] = float(value)
+                except Exception:
+                    defaults[key] = value
+        self._last_aux_stats = defaults
+        if not hasattr(self, '_aux_epoch_stats') or self._aux_epoch_stats is None:
+            self._aux_epoch_stats = []
+        self._aux_epoch_stats.append(defaults)
+
     def _compute_aux_losses(self, extras: dict, target: Union[List[torch.Tensor], torch.Tensor]):
         if extras is None or (self.lambda_align == 0 and self.lambda_heat == 0):
+            self._update_aux_logging(None)
             return 0.0
+
+        scale = float(getattr(self, '_aux_scale', 1.0))
 
         # get highest-resolution seg target if DS
         if isinstance(target, list):
@@ -277,6 +433,7 @@ class nnUNetTrainerMultiEncoderUNetText(nnUNetTrainerMultiEncoderUNet):
         # assume 'sim' is in [0,1] after sigmoid and possibly upsampled to match seg size
         sim = extras.get('sim', None)
         if sim is None:
+            self._update_aux_logging(None)
             return 0.0
 
         # L_align: 1 - mean(sim) over positive pixels (ignore background-only slices safely)
@@ -300,15 +457,40 @@ class nnUNetTrainerMultiEncoderUNetText(nnUNetTrainerMultiEncoderUNet):
         sim = sim.clamp(1e-6, 1. - 1e-6)
         if not torch.isfinite(sim).all():
             # skip aux loss if numerically unstable
-            return self.lambda_align * l_align
+            align_contrib = self.lambda_align * l_align
+            stats = {
+                'total': float((align_contrib).detach().cpu().item()),
+                'align_contrib': float((align_contrib).detach().cpu().item()),
+                'heat_contrib': 0.0,
+                'align_raw': float(l_align.detach().cpu().item()),
+                'heat_raw': 0.0,
+                'scale': scale,
+                'align_weight_scaled': self.lambda_align,
+                'heat_weight_scaled': 0.0,
+            }
+            self._update_aux_logging(stats)
+            return align_contrib
         with torch.autocast(self.device.type, enabled=False) if self.device.type == 'cuda' else dummy_context():
             bce = nn.functional.binary_cross_entropy(sim, fg_mask)
 
         # apply curriculum scaling if configured
-        scale = getattr(self, '_aux_scale', 1.0)
-        la = self.lambda_align * float(scale)
-        lh = self.lambda_heat * float(scale)
-        return la * l_align + lh * bce
+        la = self.lambda_align * scale
+        lh = self.lambda_heat * scale
+        align_contrib = la * l_align
+        heat_contrib = lh * bce
+        total = align_contrib + heat_contrib
+        stats = {
+            'total': float(total.detach().cpu().item()),
+            'align_contrib': float(align_contrib.detach().cpu().item()),
+            'heat_contrib': float(heat_contrib.detach().cpu().item()),
+            'align_raw': float(l_align.detach().cpu().item()),
+            'heat_raw': float(bce.detach().cpu().item()),
+            'scale': scale,
+            'align_weight_scaled': la,
+            'heat_weight_scaled': lh,
+        }
+        self._update_aux_logging(stats)
+        return total
 
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
@@ -346,296 +528,156 @@ class nnUNetTrainerMultiEncoderUNetText(nnUNetTrainerMultiEncoderUNet):
             else:
                 seg, extras = output, None
 
-            l = self.loss(seg, target)
+            seg_loss = self.loss(seg, target)
+            aux_total = seg_loss.new_tensor(0.0) if isinstance(seg_loss, torch.Tensor) else 0.0
+            aux_logged = False
             if text is not None and extras is not None:
-                l = l + self._compute_aux_losses(extras, target)
+                aux_total = self._compute_aux_losses(extras, target)
+                aux_logged = True
+            total_loss = seg_loss + aux_total
+
+        if not aux_logged:
+            self._update_aux_logging(None)
 
         # skip non-finite loss to avoid poisoning optimizer state
-        if not torch.isfinite(l):
+        if not torch.isfinite(total_loss):
             self.print_to_log_file('WARNING: non-finite loss detected in text trainer; skipping optimizer step')
             self.optimizer.zero_grad(set_to_none=True)
             return {'loss': float(0.0)}
 
         if self.grad_scaler is not None:
-            self.grad_scaler.scale(l).backward()
+            self.grad_scaler.scale(total_loss).backward()
             self.grad_scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.grad_scaler.step(self.optimizer)
             self.grad_scaler.update()
         else:
-            l.backward()
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
-        return {'loss': l.detach().cpu().numpy()}
+        self._global_iteration = getattr(self, '_global_iteration', 0) + 1
+        self._epoch_iteration = getattr(self, '_epoch_iteration', 0) + 1
+        aux_stats = getattr(self, '_last_aux_stats', None)
+        result = {'loss': float(total_loss.detach().cpu().item())}
+        if aux_stats is not None:
+            result.update({
+                'aux_total': float(aux_stats.get('total', 0.0)),
+                'aux_align': float(aux_stats.get('align_contrib', 0.0)),
+                'aux_heat': float(aux_stats.get('heat_contrib', 0.0)),
+            })
+        return result
 
-    def on_epoch_start(self):
-        # keep base logging and timers
-        super().on_epoch_start()
-        # update auxiliary loss scale according to warmup/ramp schedule
-        warm = getattr(self, 'aux_warmup_epochs', 0)
-        ramp = getattr(self, 'aux_ramp_epochs', 0)
-        if warm == 0 and ramp == 0:
-            self._aux_scale = 1.0
+    def on_train_epoch_end(self, train_outputs: List[dict]):
+        super().on_train_epoch_end(train_outputs)
+        stats_list = getattr(self, '_aux_epoch_stats', None)
+        if not stats_list:
             return
-        e = int(self.current_epoch)
-        if e < warm:
-            new_scale = 0.0
-        elif e < (warm + ramp) and ramp > 0:
-            # linear ramp from 0 -> 1 across ramp epochs
-            new_scale = float(e - warm + 1) / float(max(1, ramp))
-            new_scale = max(0.0, min(1.0, new_scale))
-        else:
-            new_scale = 1.0
-        if abs(new_scale - float(getattr(self, '_aux_scale', 0.0))) > 1e-6:
-            self._aux_scale = new_scale
-            self.print_to_log_file(
-                f"Aux loss scale updated to {self._aux_scale:.3f} (warmup={warm}, ramp={ramp})")
-
-    def validation_step(self, batch: dict) -> dict:
-        # This mirrors nnUNetTrainer.validation_step but passes text to the network
-        from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
-        data = batch['data']
-        target = batch['target']
-
-        data = data.to(self.device, non_blocking=True)
-        if isinstance(target, list):
-            target = [i.to(self.device, non_blocking=True) for i in target]
-        else:
-            target = target.to(self.device, non_blocking=True)
-
-        # Prepare text for this batch
-        text = self.text_embed
-        if text is not None:
-            if text.shape[0] == 1 and data.shape[0] > 1:
-                text = text.expand(data.shape[0], -1)
-            else:
-                text = text[: data.shape[0]]
-        elif hasattr(self, 'text_embed_param'):
-            text = self.text_embed_param[:1].expand(data.shape[0], -1)
-
-        with torch.autocast(self.device.type, enabled=self.use_amp) if self.device.type == 'cuda' else dummy_context():
-            out = None
-            try:
-                output = self.network(data, text=text)
-            except TypeError:
-                output = self.network(data)
-            # do not use extras in loss here; keep validation loss comparable
-            l = self.loss(output, target)
-
-        # online evaluation (pseudo dice)
-        if self.enable_deep_supervision:
-            output = output[0]
-            target = target[0]
-
-        axes = [0] + list(range(2, output.ndim))
-        if self.label_manager.has_regions:
-            predicted_segmentation_onehot = (torch.sigmoid(output) > 0.5).long()
-        else:
-            output_seg = output.argmax(1)[:, None]
-            predicted_segmentation_onehot = torch.zeros(output.shape, device=output.device, dtype=torch.float32)
-            predicted_segmentation_onehot.scatter_(1, output_seg, 1)
-            del output_seg
-
-        if self.label_manager.has_ignore_label:
-            if not self.label_manager.has_regions:
-                mask = (target != self.label_manager.ignore_label).float()
-                target[target == self.label_manager.ignore_label] = 0
-            else:
-                if target.dtype == torch.bool:
-                    mask = ~target[:, -1:]
-                else:
-                    mask = 1 - target[:, -1:]
-                target = target[:, :-1]
-        else:
-            mask = None
-
-        tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot, target, axes=axes, mask=mask)
-        tp_hard = tp.detach().cpu().numpy()
-        fp_hard = fp.detach().cpu().numpy()
-        fn_hard = fn.detach().cpu().numpy()
-        if not self.label_manager.has_regions:
-            tp_hard = tp_hard[1:]
-            fp_hard = fp_hard[1:]
-            fn_hard = fn_hard[1:]
-
-        # Optionally save heatmaps (no_grad) for inspection
-        if self.save_heatmaps:
-            with torch.no_grad():
-                keys = batch.get('keys', None)
-                try:
-                    out = self.network(data, text=text, return_extra=True)
-                except TypeError:
-                    out = None
-                if isinstance(out, dict) and 'sim' in out:
-                    sim = out['sim'].detach().cpu()
-                    img = data.detach().cpu()
-                    out_dir = join(self.output_folder, 'val_heatmaps', f'epoch_{self.current_epoch:03d}')
-                    maybe_mkdir_p(out_dir)
-                    b = sim.shape[0]
-                    for bi in range(b):
-                        if sim.ndim == 5:
-                            _, _, z, y, x = sim.shape
-                            mid = z // 2
-                            heat = sim[bi, 0, mid].numpy()
-                            bg = img[bi, 0, mid].numpy()
-                        else:
-                            heat = sim[bi, 0].numpy()
-                            bg = img[bi, 0].numpy()
-                        name = keys[bi] if keys is not None and bi < len(keys) else f'sample{bi}'
-                        path = join(out_dir, f'{name}.png')
-                        plt.figure(figsize=(5, 5))
-                        plt.imshow(bg, cmap='gray')
-                        plt.imshow(heat, cmap='hot', alpha=0.5, vmin=0, vmax=1)
-                        plt.axis('off')
-                        plt.tight_layout()
-                        plt.savefig(path, dpi=150)
-                        plt.close()
-
-        return {'loss': float(l.detach().cpu().item()), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
-
-    # ---------- Full-volume heatmap export ----------
-    @torch.inference_mode()
-    def _predict_full_heatmap(self, data: torch.Tensor) -> torch.Tensor:
-        """Aggregate text heatmap over the full case using sliding-window prediction.
-        Returns a tensor of shape [1, *image_size] on CPU.
-        """
-        self.network.eval()
-        device = self.device
-        # pad to patch size
-        data, slicer_revert_padding = pad_nd_image(data, self.configuration_manager.patch_size,
-                                                   'constant', {'value': 0}, True,
-                                                   None)
-
-        image_size = data.shape[1:]
-        tile_size = tuple(self.configuration_manager.patch_size)
-        steps = compute_steps_for_sliding_window(image_size, tile_size, 0.5)
-        # build slicers
-        slicers = []
-        for z in steps[0 if len(image_size)==1 else 0]:
-            pass  # dummy to appease flake
-        # general slicer generation
-        import itertools
-        for coords in itertools.product(*steps):
-            sl = (slice(None),) + tuple(slice(int(c), int(c)+int(t)) for c, t in zip(coords, tile_size))
-            slicers.append(sl)
-
-        # preallocate
-        pred = torch.zeros((1, *image_size), dtype=torch.float16, device=device)
-        nmap = torch.zeros(image_size, dtype=torch.float16, device=device)
-        if self.inference_allowed_mirroring_axes is not None:
-            mirror_axes = [m + 2 for m in self.inference_allowed_mirroring_axes]
-        else:
-            mirror_axes = None
-        gauss = compute_gaussian(tile_size, sigma_scale=1./8, value_scaling_factor=10, device=device)
-
-        for sl in slicers:
-            x = torch.clone(data[sl][None], memory_format=torch.contiguous_format).to(device)
-            # forward
-            try:
-                out = self.network(x, text=(self.text_embed[:1] if self.text_embed is not None else None), return_extra=True)
-            except TypeError:
-                out = None
-            if isinstance(out, dict) and 'sim' in out:
-                h = out['sim'][0].to(device)  # [1, *tile]
-            else:
-                # if heatmap unavailable, fill zeros
-                h = torch.zeros((1, *tile_size), dtype=torch.float16, device=device)
-
-            # TTA mirroring if desired
-            if mirror_axes is not None:
-                import itertools as it
-                for axes in [c for i in range(len(mirror_axes)) for c in it.combinations(mirror_axes, i + 1)]:
-                    try:
-                        tmp = self.network(torch.flip(x, axes), text=(self.text_embed[:1] if self.text_embed is not None else None), return_extra=True)
-                        if isinstance(tmp, dict) and 'sim' in tmp:
-                            h += torch.flip(tmp['sim'][0].to(device), axes)
-                    except TypeError:
-                        pass
-                h /= (1 + len([c for i in range(len(mirror_axes)) for c in it.combinations(mirror_axes, i + 1)]))
-
-            h = h * gauss  # weighting
-            pred[sl] += h
-            nmap[sl[1:]] += gauss
-
-        torch.div(pred, nmap, out=pred)
-        pred = pred[(slice(None), *slicer_revert_padding[1:])].to('cpu')
-        return pred
-
-    def _save_full_heatmap_npz(self, heatmap: torch.Tensor, properties: dict, ofile_truncated: str):
-        """Saves two npz files: preprocessed space and original image space.
-        If NNUNET_EXPORT_HEATMAP_NIFTI is enabled, also writes an orig-space NIfTI.
-        """
-        import numpy as np
-        import os
-        hm = heatmap.numpy().astype(np.float32)
-        np.savez_compressed(ofile_truncated + '_pproc_heatmap.npz', heatmap=hm)
-
-        # try to map back to original image space (like probabilities path)
         try:
-            # reuse the export pipeline for resampling & cropping reversion
-            from nnunetv2.utilities.label_handling.label_handling import LabelManager
-            label_manager = self.plans_manager.get_label_manager(self.dataset_json)
-            spacing_transposed = [properties['spacing'][i] for i in self.plans_manager.transpose_forward]
-            current_spacing = self.configuration_manager.spacing if \
-                len(self.configuration_manager.spacing) == len(properties['shape_after_cropping_and_before_resampling']) else \
-                [spacing_transposed[0], *self.configuration_manager.spacing]
-
-            res = self.configuration_manager.resampling_fn_probabilities(
-                heatmap, properties['shape_after_cropping_and_before_resampling'], current_spacing,
-                [properties['spacing'][i] for i in self.plans_manager.transpose_forward]
-            )
-            if isinstance(res, torch.Tensor):
-                res = res.cpu().numpy()
-            # revert cropping & transpose like probabilities path
-            probs_rev = label_manager.revert_cropping_on_probabilities(
-                torch.from_numpy(res), properties['bbox_used_for_cropping'], properties['shape_before_cropping'])
-            if isinstance(probs_rev, torch.Tensor):
-                probs_rev = probs_rev.numpy()
-            probs_rev = probs_rev.transpose([0] + [i + 1 for i in self.plans_manager.transpose_backward])
-            probs_rev = probs_rev.astype(np.float32)
-            np.savez_compressed(ofile_truncated + '_orig_heatmap.npz', heatmap=probs_rev)
-
-            # Optional NIfTI export (orig space)
-            if self.export_heatmap_nifti:
-                try:
-                    import SimpleITK as sitk
-                    sitk_info = properties.get('sitk_stuff', {})
-                    # probs_rev shape: (C, X, Y, Z). Use channel 0
-                    arr_xyz = probs_rev[0]
-                    # sitk expects (z,y,x)
-                    arr_zyx = np.transpose(arr_xyz, (2, 1, 0))
-                    img = sitk.GetImageFromArray(arr_zyx)
-                    if 'spacing' in sitk_info:
-                        img.SetSpacing(tuple(float(s) for s in sitk_info['spacing']))
-                    if 'origin' in sitk_info:
-                        img.SetOrigin(tuple(float(o) for o in sitk_info['origin']))
-                    if 'direction' in sitk_info:
-                        dirv = sitk_info['direction']
-                        img.SetDirection(tuple(float(d) for d in dirv))
-                    sitk.WriteImage(img, ofile_truncated + '_orig_heatmap.nii.gz', useCompression=True)
-                except Exception as e:
-                    self.print_to_log_file(f'WARNING: Failed to save NIfTI heatmap for {ofile_truncated}: {e}')
-        except Exception as e:
-            self.print_to_log_file(f'WARNING: Failed to save orig-space heatmap for {ofile_truncated}: {e}')
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        # first run the default validation (saves segmentations and metrics)
-        super().perform_actual_validation(save_probabilities)
-
-        # optional: export full-case heatmaps
-        if not self.export_full_heatmap or self.text_embed is None:
+            total_mean = float(np.mean([s.get('total', 0.0) for s in stats_list]))
+            align_mean = float(np.mean([s.get('align_contrib', 0.0) for s in stats_list]))
+            heat_mean = float(np.mean([s.get('heat_contrib', 0.0) for s in stats_list]))
+            raw_align_mean = float(np.mean([s.get('align_raw', 0.0) for s in stats_list]))
+            raw_heat_mean = float(np.mean([s.get('heat_raw', 0.0) for s in stats_list]))
+            scale_mean = float(np.mean([s.get('scale', 0.0) for s in stats_list]))
+        except Exception:
             return
+        self.print_to_log_file(
+            f"[aux_epoch_summary] epoch={self.current_epoch} total_mean={total_mean:.6f} "
+            f"align_mean={align_mean:.6f} heat_mean={heat_mean:.6f} "
+            f"raw_align_mean={raw_align_mean:.6f} raw_heat_mean={raw_heat_mean:.6f} "
+            f"scale_mean={scale_mean:.3f}"
+        )
 
-        self.network.eval()
-        # collect val keys similar to base implementation
-        _, val_keys = self.do_split()
-        dataset_val = self.dataset_class(self.preprocessed_dataset_folder, val_keys)
+    def on_train_epoch_start(self):
+        """
+        Extend base hook to update auxiliary-loss schedule (_aux_scale) with warmup + linear ramp.
+        - Warmup: epochs [0, aux_warmup_epochs) -> scale = 0
+        - Ramp:   next aux_ramp_epochs epochs linearly increase to 1
+        - After:  scale = 1
+        """
+        super().on_train_epoch_start()
+        self._epoch_iteration = 0
+        self._aux_epoch_stats = []
+        self._last_aux_stats = None
+        # base schedule from static warmup+ramp
+        try:
+            w = int(getattr(self, 'aux_warmup_epochs', 0) or 0)
+            r = int(getattr(self, 'aux_ramp_epochs', 0) or 0)
+        except Exception:
+            w, r = 0, 0
+        e = int(getattr(self, 'current_epoch', 0) or 0)
 
-        out_base = join(self.output_folder, 'validation', self.heatmap_dirname)
-        maybe_mkdir_p(out_base)
-        for k in dataset_val.identifiers:
-            self.print_to_log_file(f"exporting full heatmap {k}")
-            data, _, _, properties = dataset_val.load_case(k)
-            data = torch.from_numpy(data[:])  # [C, ...]
-            hm = self._predict_full_heatmap(data)  # [1, ...] cpu
-            self._save_full_heatmap_npz(hm, properties, join(out_base, k))
+        # dynamic controls via env (enabled by default)
+        def _truthy(x: str) -> bool:
+            return str(x).lower() in ('1', 'true', 'yes', 'y')
+        dyn_enable = _truthy(os.environ.get('NNUNET_AUX_DYNAMIC', '1'))
+        try:
+            k = int(os.environ.get('NNUNET_AUX_LOSS_STABLE_EPOCHS', '5'))
+        except Exception:
+            k = 5
+        try:
+            rel_thr = float(os.environ.get('NNUNET_AUX_LOSS_REL_CHANGE', '0.05'))
+        except Exception:
+            rel_thr = 0.05
+        try:
+            ema_thr = float(os.environ.get('NNUNET_AUX_EMA_DICE_THRESH', '0.30'))
+        except Exception:
+            ema_thr = 0.30
+        try:
+            hard_start_env = os.environ.get('NNUNET_AUX_HARD_START_EPOCH', '').strip()
+            hard_start = int(hard_start_env) if hard_start_env else (w + r if (w + r) > 0 else w)
+        except Exception:
+            hard_start = w + r if (w + r) > 0 else w
+
+        # compute baseline scale without dynamics
+        def _baseline_scale(epoch: int) -> float:
+            if w <= 0 and r <= 0:
+                return 1.0
+            if epoch < w:
+                return 0.0
+            if r > 0 and epoch < (w + r):
+                return max(0.0, min(1.0, (epoch - w + 1) / float(r)))
+            return 1.0
+
+        scale = _baseline_scale(e)
+
+        # dynamic adjustment: delay ramp until stability (loss change small or EMA dice decent),
+        # but start at latest by hard_start
+        if dyn_enable and r > 0:
+            # check stability metrics from logger (previous epochs)
+            stable = False
+            try:
+                logs = getattr(self, 'logger', None)
+                if logs is not None and hasattr(logs, 'my_fantastic_logging'):
+                    hist = logs.my_fantastic_logging
+                    tr = hist.get('train_losses', [])
+                    em = hist.get('ema_fg_dice', [])
+                    # loss stability: compare mean of last k vs previous k epochs
+                    if len(tr) >= 2 * k and k > 0:
+                        m2 = float(np.mean(tr[-k:]))
+                        m1 = float(np.mean(tr[-2 * k:-k]))
+                        denom = max(1e-8, abs(m1))
+                        rel = abs(m2 - m1) / denom
+                        loss_stable = rel < rel_thr
+                    else:
+                        loss_stable = False
+                    # ema dice threshold
+                    ema_ok = (len(em) > 0) and (float(em[-1]) >= ema_thr)
+                    stable = loss_stable or ema_ok
+            except Exception:
+                stable = False
+
+            if e >= w:
+                if not stable and e < hard_start:
+                    # extend warmup until stability or hard_start
+                    scale = 0.0
+                else:
+                    # start or continue ramp from configured w
+                    scale = _baseline_scale(e)
+
+        self._aux_scale = float(scale)
+        try:
+            self.print_to_log_file(
+                f"[aux_schedule] epoch={e} warmup={w} ramp={r} hard_start={hard_start} dyn={int(dyn_enable)} scale={self._aux_scale:.3f}")
+        except Exception:
+            pass

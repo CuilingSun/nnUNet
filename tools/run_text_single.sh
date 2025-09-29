@@ -19,6 +19,7 @@ CONFIG="${4:-3d_fullres}"
 PLANS="${5:-nnUNetPlans}"
 # Optional 6th arg: loss kind for Text trainer: dice|tversky|focal_tversky
 LOSS_KIND_ARG="${6:-}"
+TRAINER="${NNUNET_TRAINER:-nnUNetTrainerMultiEncoderUNetText}"
 
 # Normalize/select NNUNET_TEXT_LOSS value (trainer expects: dice_topk|tversky_topk|focal_tversky_topk)
 LOSS_ENV=""
@@ -85,7 +86,7 @@ export NNUNET_EXPORT_HEATMAP_NIFTI="${NNUNET_EXPORT_HEATMAP_NIFTI:-0}"
 export NNUNET_HEATMAP_DIRNAME="${NNUNET_HEATMAP_DIRNAME:-validation_heatmaps}"
 
 # Precompute dataset/plans paths for evaluation & postprocess
-PY_GETS=python3
+PY_GETS=${PY_GETS:-$(command -v python)}
 PP_BASE=$($PY_GETS - "$DATASET" <<'PY'
 from nnunetv2.paths import nnUNet_preprocessed
 from nnunetv2.utilities.dataset_name_id_conversion import maybe_convert_to_dataset_name
@@ -101,15 +102,15 @@ GTFOLDER="${PP_BASE}/gt_segmentations"
 timestamp() { date +"%Y%m%d_%H%M%S"; }
 LOG_ROOT="${LOG_ROOT:-/data2/yyp4247/nnUNet/log}"
 mkdir -p "$LOG_ROOT"
-LOGDIR="${LOG_ROOT}/logs_${DATASET}_${CONFIG}_nnUNetTrainerMultiEncoderUNetText"
+LOGDIR="${LOG_ROOT}/logs_${DATASET}_${CONFIG}_${TRAINER}"
 mkdir -p "$LOGDIR"
 LOGFILE_TRAIN="${LOGDIR}/train_TextTopKCE_$(timestamp).log"
 LOGFILE_VAL="${LOGDIR}/val_TextTopKCE_$(timestamp).log"
 
-echo "[nnUNetTrainerMultiEncoderUNetText] GPU=${GPU} | MODE=${MODE_STR} | FOLD=${FOLD} | PROMPTS='${NNUNET_TEXT_PROMPTS}'"
+echo "[${TRAINER}] GPU=${GPU} | MODE=${MODE_STR} | FOLD=${FOLD} | PROMPTS='${NNUNET_TEXT_PROMPTS}'"
 
 # Compute output folder for later evaluation
-OUTFOLD=$($PY_GETS - "$DATASET" "nnUNetTrainerMultiEncoderUNetText" "$PLANS" "$CONFIG" "$FOLD" <<'PY'
+OUTFOLD=$($PY_GETS - "$DATASET" "$TRAINER" "$PLANS" "$CONFIG" "$FOLD" <<'PY'
 from nnunetv2.utilities.file_path_utilities import get_output_folder
 import os,sys
 print(get_output_folder(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], fold=int(sys.argv[5])))
@@ -121,16 +122,15 @@ VALFOLDER="${OUTFOLD}/validation"
 SWEEP_LIST="${SWEEP_LIST:-0 10 20 50 100}"
 KEEP_LARGEST="${KEEP_LARGEST:-1}"
 
-# Launch as independent session for safe stopping later: train -> val_best -> eval -> postprocess sweeps
-setsid bash -c "\
-  set -euo pipefail; \
+# Build the command block once
+CMD_BLOCK="set -euo pipefail; \
   export CUDA_VISIBLE_DEVICES='$GPU'; \
   ${LOSS_ENV:+export NNUNET_TEXT_LOSS='${LOSS_ENV}'; } \
   NNUNET_ITERS_PER_EPOCH=${NNUNET_ITERS_PER_EPOCH} \
   NNUNET_VAL_ITERS=${NNUNET_VAL_ITERS} \
-  nnUNetv2_train '$DATASET' '$CONFIG' '$FOLD' -tr nnUNetTrainerMultiEncoderUNetText -p '$PLANS' -num_gpus 1 2>&1 | tee -a "$LOGFILE_TRAIN"; \
+  nnUNetv2_train '$DATASET' '$CONFIG' '$FOLD' -tr '$TRAINER' -p '$PLANS' -num_gpus 1 2>&1 | tee -a \"$LOGFILE_TRAIN\"; \
   if [ -f \"$OUTFOLD/checkpoint_best.pth\" ]; then \
-    nnUNetv2_train '$DATASET' '$CONFIG' '$FOLD' -tr nnUNetTrainerMultiEncoderUNetText -p '$PLANS' --val --val_best 2>&1 | tee -a "$LOGFILE_VAL"; \
+    nnUNetv2_train '$DATASET' '$CONFIG' '$FOLD' -tr '$TRAINER' -p '$PLANS' --val --val_best 2>&1 | tee -a \"$LOGFILE_VAL\"; \
   else \
     echo \"[run_text_single] Skip validation: no checkpoint_best.pth yet in $OUTFOLD\" | tee -a \"$LOGFILE_VAL\"; \
   fi; \
@@ -140,12 +140,14 @@ setsid bash -c "\
       OUTPP=\"${VALFOLDER}_pp_min\${MV}\"; \
       if [ \"$KEEP_LARGEST\" = \"1\" ]; then OUTPP=\"\${OUTPP}_lcc\"; fi; \
       mkdir -p \"\$OUTPP\"; \
-      python tools/postprocess_cc.py --in \"$VALFOLDER\" --out \"\$OUTPP\" --labels 1 --min-voxels \"\${MV}\" $( [ \"$KEEP_LARGEST\" = \"1\" ] && echo --keep-largest ); \
+      EXTRA_ARG=''; \
+      if [ \"$KEEP_LARGEST\" = \"1\" ]; then EXTRA_ARG='--keep-largest'; fi; \
+      "${PY_GETS}" tools/postprocess_cc.py --in \"$VALFOLDER\" --out \"\$OUTPP\" --labels 1 --min-voxels \"\${MV}\" \$EXTRA_ARG; \
       nnUNetv2_evaluate_folder \"$GTFOLDER\" \"\$OUTPP\" -djfile \"$DJFILE\" -pfile \"$PFILE\" -o \"\$OUTPP/summary.json\" 2>&1 | tee -a \"$LOGFILE_VAL\"; \
     done; \
   else \
     echo \"[run_text_single] Skip evaluation/postprocess: validation folder not found: $VALFOLDER\" | tee -a \"$LOGFILE_VAL\"; \
-  fi \
-" >/dev/null 2>&1 &
+  fi"
 
-echo "Launched -> $LOGFILE_TRAIN (and $LOGFILE_VAL). Output: $OUTFOLD"
+# Always run in foreground so logs stream to terminal and Ctrl+C works
+bash -c "$CMD_BLOCK"

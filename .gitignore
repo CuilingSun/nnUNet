@@ -121,3 +121,11 @@ out_heatmap_grid_gate/
 
 # Training logs (do not commit)
 log/
+
+# Codex CLI artifacts
+.codex_write_test
+.ro_test
+session.task
+
+# Pretrained weights
+pretrained/
