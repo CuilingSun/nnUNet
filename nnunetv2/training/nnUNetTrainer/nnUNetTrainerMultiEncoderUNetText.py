@@ -105,10 +105,12 @@ class nnUNetTrainerMultiEncoderUNetText(nnUNetTrainerMultiEncoderUNet):
             if dec is None:
                 return
             uses_modulation = any(not isinstance(m, nn.Identity) for m in getattr(dec, 'modulators', []))
-            # also consider alignment head on the main network
+            # also consider alignment head / cross attention / text adapter on the main network
             align_needed = bool(getattr(self.network, 'use_alignment_head', False))
+            cross_attn_needed = bool(getattr(self.network, 'use_cross_attn_final', False))
+            adapter_needed = bool(getattr(self.network, 'use_text_adapter', False))
             dim = getattr(dec, 'text_embed_dim', None)
-            if (uses_modulation or align_needed) and self.text_embed is None and dim is not None:
+            if (uses_modulation or align_needed or cross_attn_needed or adapter_needed) and self.text_embed is None and dim is not None:
                 # create a learnable parameter initialized to zeros
                 self.text_embed_param = nn.Parameter(torch.zeros(1, int(dim), device=self.device))
                 # add to optimizer so it learns along with the network

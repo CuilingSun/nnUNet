@@ -129,3 +129,7 @@ session.task
 
 # Pretrained weights
 pretrained/
+
+# local env backups / conda temp
+nnunetv2_env_backup_*.yml
+condarc_tmp.yml

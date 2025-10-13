@@ -4,6 +4,7 @@ set -euo pipefail
 # Run a single Text trainer (nnUNetTrainerMultiEncoderUNetText) job with convenient defaults.
 # Usage:
 #   bash tools/run_text_single.sh <GPU_ID> [FOLD] [DATASET] [CONFIG] [PLANS]
+# Optional env: NNUNET_PRETRAINED_WEIGHTS=/path/to/checkpoint.pth to finetune
 # Example:
 #   bash tools/run_text_single.sh 4 0 Dataset2202_picai_split 3d_fullres nnUNetPlans
 #
@@ -122,13 +123,19 @@ VALFOLDER="${OUTFOLD}/validation"
 SWEEP_LIST="${SWEEP_LIST:-0 10 20 50 100}"
 KEEP_LARGEST="${KEEP_LARGEST:-1}"
 
+PRETRAINED_WEIGHTS="${NNUNET_PRETRAINED_WEIGHTS:-}" # optional: fine-tune from checkpoint
+PRETRAINED_ARG=""
+if [[ -n "${PRETRAINED_WEIGHTS}" ]]; then
+  PRETRAINED_ARG="-pretrained_weights '${PRETRAINED_WEIGHTS}'"
+fi
+
 # Build the command block once
 CMD_BLOCK="set -euo pipefail; \
   export CUDA_VISIBLE_DEVICES='$GPU'; \
   ${LOSS_ENV:+export NNUNET_TEXT_LOSS='${LOSS_ENV}'; } \
   NNUNET_ITERS_PER_EPOCH=${NNUNET_ITERS_PER_EPOCH} \
   NNUNET_VAL_ITERS=${NNUNET_VAL_ITERS} \
-  nnUNetv2_train '$DATASET' '$CONFIG' '$FOLD' -tr '$TRAINER' -p '$PLANS' -num_gpus 1 2>&1 | tee -a \"$LOGFILE_TRAIN\"; \
+  nnUNetv2_train '$DATASET' '$CONFIG' '$FOLD' -tr '$TRAINER' -p '$PLANS' -num_gpus 1 ${PRETRAINED_ARG} 2>&1 | tee -a \"$LOGFILE_TRAIN\"; \
   if [ -f \"$OUTFOLD/checkpoint_best.pth\" ]; then \
     nnUNetv2_train '$DATASET' '$CONFIG' '$FOLD' -tr '$TRAINER' -p '$PLANS' --val --val_best 2>&1 | tee -a \"$LOGFILE_VAL\"; \
   else \
