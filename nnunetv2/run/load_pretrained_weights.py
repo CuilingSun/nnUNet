@@ -24,6 +24,8 @@ def load_pretrained_weights(network, fname, verbose=False):
 
     skip_strings_in_pretrained = [
         '.seg_layers.',
+        '_refiner',
+        '_refine_head',
     ]
 
     if isinstance(network, DDP):
@@ -66,5 +68,4 @@ def load_pretrained_weights(network, fname, verbose=False):
             print(key, 'shape', value.shape)
         print("################### Done ###################")
     mod.load_state_dict(model_dict)
-
 

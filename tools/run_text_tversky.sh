@@ -2,6 +2,7 @@
 set -euo pipefail
 # Wrapper to launch Text trainer with Tversky+TopKCE
 # Usage: bash tools/run_text_tversky.sh <GPU_ID> [FOLD] [DATASET] [CONFIG] [PLANS]
+export NNUNET_LAMBDA_ALIGN="${NNUNET_LAMBDA_HEAT:-0}"
 exec bash "$(dirname "$0")/run_text_single.sh" "${1:?Need GPU}" "${2:-0}" "${3:-Dataset2203_picai_split}" "${4:-3d_fullres}" "${5:-nnUNetPlans}" tversky
 
 # - 用法: bash tools/run_text_tversky.sh GPU_ID [FOLD] [DATASET] [CONFIG] [PLANS]

@@ -1,8 +1,13 @@
+import os
+
 import torch
 from torch import nn
 from typing import List, Tuple, Union
+from batchgenerators.utilities.file_and_folder_operations import load_json
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.utilities.plans_handling.plans_handler import ConfigurationManager, PlansManager
+from nnunetv2.utilities.dataset_name_id_conversion import maybe_convert_to_dataset_name
+from nnunetv2.paths import nnUNet_preprocessed, nnUNet_results
 
 from nnunetv2.nets.MultiEncoderUNet import (
     get_multi_encoder_unet_2d_from_plans,
@@ -31,33 +36,143 @@ class nnUNetTrainerMultiEncoderUNet(nnUNetTrainer):
 
     def build_network_architecture(
         self,
-        architecture_class_name: str,
-        arch_init_kwargs: dict,
-        arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
-        num_input_channels: int,
-        num_output_channels: int,
-        enable_deep_supervision: bool = True,
+        *args,
+        **kwargs,
     ) -> nn.Module:
+        """Build MultiEncoderUNet for both training (instance call) and inference (class call).
+
+        nnUNet's inference utilities call this as a class method, so we need to gracefully
+        handle missing `self` and fetch configuration objects from kwargs instead.
         """
-        Override to ignore the plans' default architecture and instead build the
-        MultiEncoderUNet directly from our Plans/Configuration. We keep the
-        signature compatible with the base class so nnUNetTrainer.initialize can
-        call us without errors.
-        """
+
+        args_list = list(args)
+
+        # Defensive: if python passes self positionally we remove it to avoid confusion.
+        if args_list and args_list[0] is self:
+            args_list.pop(0)
+
+        trainer_instance = self if isinstance(self, nnUNetTrainerMultiEncoderUNet) else None
+
+        architecture_class_name = kwargs.pop('architecture_class_name', None)
+        arch_init_kwargs = kwargs.pop('arch_init_kwargs', None)
+        arch_init_kwargs_req_import = kwargs.pop('arch_init_kwargs_req_import', None)
+        num_input_channels = kwargs.pop('num_input_channels', None)
+        num_output_channels = kwargs.pop('num_output_channels', None)
+        enable_deep_supervision = kwargs.pop('enable_deep_supervision', True)
+
+        def _pop_or(current):
+            return current if current is not None else (args_list.pop(0) if args_list else None)
+
+        if trainer_instance is None and architecture_class_name is None:
+            architecture_class_name = self
+
+        architecture_class_name = _pop_or(architecture_class_name)
+        arch_init_kwargs = _pop_or(arch_init_kwargs) or {}
+        arch_init_kwargs_req_import = _pop_or(arch_init_kwargs_req_import)
+        num_input_channels = _pop_or(num_input_channels)
+        num_output_channels = _pop_or(num_output_channels)
+
+        if args_list:
+            enable_deep_supervision = args_list.pop(0)
+
+        if architecture_class_name is None or num_input_channels is None or num_output_channels is None:
+            raise RuntimeError(
+                "build_network_architecture expects architecture_class_name, num_input_channels and num_output_channels"
+            )
+
+        plans_manager = arch_init_kwargs.get('plans_manager') or kwargs.get('plans_manager')
+        configuration_manager = arch_init_kwargs.get('configuration_manager') or kwargs.get('configuration_manager')
+        dataset_json = arch_init_kwargs.get('dataset_json') or kwargs.get('dataset_json')
+
+        if trainer_instance is not None:
+            plans_manager = plans_manager or trainer_instance.plans_manager
+            configuration_manager = configuration_manager or trainer_instance.configuration_manager
+            dataset_json = dataset_json or trainer_instance.dataset_json
+
+        # Fallback for inference: rebuild managers from env hints if they are missing
+        if plans_manager is None or configuration_manager is None or dataset_json is None:
+            plans_path_env = os.environ.get('NNUNET_PLANS_FILE')
+            results_dir = os.environ.get('NNUNET_RESULTS_DIR') or os.environ.get('nnUNet_results', nnUNet_results)
+            dataset_id = os.environ.get('NNUNET_DATASET') or os.environ.get('nnUNet_dataset')
+            plans_name = os.environ.get('NNUNET_PLANS', 'nnUNetPlans')
+            config_name = os.environ.get('NNUNET_CONFIG')
+            preprocessed_root = os.environ.get('nnUNet_preprocessed', nnUNet_preprocessed)
+
+            candidate_plans = []
+            candidate_dataset_json = None
+
+            if plans_path_env and os.path.isfile(plans_path_env):
+                candidate_plans.append(plans_path_env)
+
+            if results_dir:
+                model_output_dir = kwargs.get('model_output_dir') or arch_init_kwargs.get('model_output_dir')
+                if model_output_dir:
+                    trainer_dir = model_output_dir
+                elif dataset_id:
+                    trainer_dir = os.path.join(
+                        results_dir,
+                        maybe_convert_to_dataset_name(dataset_id),
+                        f"{trainer_instance.__class__.__name__ if trainer_instance else self.__name__}__{plans_name}__{config_name or '3d_fullres'}",
+                    )
+                else:
+                    trainer_dir = None
+
+                if trainer_dir:
+                    trainer_plans = os.path.join(trainer_dir, 'plans.json')
+                    if os.path.isfile(trainer_plans):
+                        candidate_plans.append(trainer_plans)
+                    trainer_dataset_json = os.path.join(trainer_dir, 'dataset.json')
+                    if os.path.isfile(trainer_dataset_json):
+                        candidate_dataset_json = load_json(trainer_dataset_json)
+
+            if dataset_id and preprocessed_root:
+                dataset_folder = os.path.join(preprocessed_root, maybe_convert_to_dataset_name(dataset_id))
+                candidate_plans.append(os.path.join(dataset_folder, f'{plans_name}.json'))
+                dataset_json_path = os.path.join(dataset_folder, 'dataset.json')
+                if os.path.isfile(dataset_json_path):
+                    candidate_dataset_json = load_json(dataset_json_path)
+
+            if plans_manager is None:
+                for p in candidate_plans:
+                    if os.path.isfile(p):
+                        plans_manager = PlansManager(p)
+                        break
+
+            if configuration_manager is None and plans_manager is not None:
+                cfg_name = (
+                    config_name
+                    or (trainer_instance.configuration_manager.configuration_name if trainer_instance else None)
+                    or '3d_fullres'
+                )
+                try:
+                    configuration_manager = plans_manager.get_configuration(cfg_name)
+                except KeyError:
+                    available = list(plans_manager.configurations.keys())
+                    configuration_manager = plans_manager.get_configuration(available[0]) if available else None
+
+            if dataset_json is None:
+                if arch_init_kwargs.get('dataset_json_path') and os.path.isfile(arch_init_kwargs['dataset_json_path']):
+                    dataset_json = load_json(arch_init_kwargs['dataset_json_path'])
+                elif candidate_dataset_json is not None:
+                    dataset_json = candidate_dataset_json
+
+        if plans_manager is None or configuration_manager is None:
+            raise RuntimeError("plans_manager and configuration_manager must be provided for network construction.")
+
         # decide 2D vs 3D from the current configuration
-        if len(self.configuration_manager.patch_size) == 2:
+        if len(configuration_manager.patch_size) == 2:
             model = get_multi_encoder_unet_2d_from_plans(
-                self.plans_manager,
-                self.dataset_json,
-                self.configuration_manager,
+                plans_manager,
+                dataset_json,
+                configuration_manager,
                 num_input_channels,
                 deep_supervision=enable_deep_supervision,
             )
-        elif len(self.configuration_manager.patch_size) == 3:
+        elif len(configuration_manager.patch_size) == 3:
             model = get_multi_encoder_unet_3d_from_plans(
-                self.plans_manager,
-                self.dataset_json,
-                self.configuration_manager,
+                plans_manager,
+                dataset_json,
+                configuration_manager,
                 num_input_channels,
                 deep_supervision=enable_deep_supervision,
             )

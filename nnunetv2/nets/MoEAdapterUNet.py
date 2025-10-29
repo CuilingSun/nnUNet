@@ -748,7 +748,7 @@ class MultiEncoderUNet(nn.Module):
         return_heatmap: bool = False,
         heatmap_temperature: float = 1.0,
         modulation: str = 'none',  # 'none' | 'film' | 'gate'
-        moe_temperature: float = 1.2,
+        moe_temperature: float = 1.0,
         use_cross_attn_final: bool = False,
         use_text_adapter: bool = False,
     ):

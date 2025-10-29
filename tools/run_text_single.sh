@@ -117,7 +117,9 @@ import os,sys
 print(get_output_folder(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], fold=int(sys.argv[5])))
 PY
 )
-VALFOLDER="${OUTFOLD}/validation"
+VALFOLDER_BASE="${OUTFOLD}/validation"
+VALFOLDER_FINAL="${OUTFOLD}/validation_final"
+VALFOLDER_BEST="${OUTFOLD}/validation_best"
 
 # Postprocess sweep settings
 SWEEP_LIST="${SWEEP_LIST:-0 10 20 50 100}"
@@ -130,30 +132,59 @@ if [[ -n "${PRETRAINED_WEIGHTS}" ]]; then
 fi
 
 # Build the command block once
-CMD_BLOCK="set -euo pipefail; \
+CMD_BLOCK="set +u; set -eo pipefail; \
   export CUDA_VISIBLE_DEVICES='$GPU'; \
   ${LOSS_ENV:+export NNUNET_TEXT_LOSS='${LOSS_ENV}'; } \
-  NNUNET_ITERS_PER_EPOCH=${NNUNET_ITERS_PER_EPOCH} \
-  NNUNET_VAL_ITERS=${NNUNET_VAL_ITERS} \
+  NNUNET_ITERS_PER_EPOCH=${NNUNET_ITERS_PER_EPOCH}; \
+  NNUNET_VAL_ITERS=${NNUNET_VAL_ITERS}; \
+  if [ -n \"${PRETRAINED_WEIGHTS}\" ]; then echo \"[run_text_single] Pretrained checkpoint: ${PRETRAINED_WEIGHTS}\" | tee -a \"$LOGFILE_TRAIN\"; fi; \
   nnUNetv2_train '$DATASET' '$CONFIG' '$FOLD' -tr '$TRAINER' -p '$PLANS' -num_gpus 1 ${PRETRAINED_ARG} 2>&1 | tee -a \"$LOGFILE_TRAIN\"; \
+  eval_and_postprocess() { \
+    local folder=\"\$1\"; \
+    local tag=\"\$2\"; \
+    if [ -d \"\$folder\" ]; then \
+      echo \"[run_text_single] Evaluating \${tag} (\${folder})\" | tee -a \"$LOGFILE_VAL\"; \
+      nnUNetv2_evaluate_folder \"$GTFOLDER\" \"\$folder\" -djfile \"$DJFILE\" -pfile \"$PFILE\" -o \"\$folder/summary.json\" 2>&1 | tee -a \"$LOGFILE_VAL\"; \
+      for MV in $SWEEP_LIST; do \
+        OUTPP=\"\${folder}_pp_min\${MV}\"; \
+        if [ \"$KEEP_LARGEST\" = \"1\" ]; then OUTPP=\"\${OUTPP}_lcc\"; fi; \
+        mkdir -p \"\$OUTPP\"; \
+        EXTRA_ARG=''; \
+        if [ \"$KEEP_LARGEST\" = \"1\" ]; then EXTRA_ARG='--keep-largest'; fi; \
+        \"${PY_GETS}\" tools/postprocess_cc.py --in \"\$folder\" --out \"\$OUTPP\" --labels 1 --min-voxels \"\${MV}\" \$EXTRA_ARG; \
+        nnUNetv2_evaluate_folder \"$GTFOLDER\" \"\$OUTPP\" -djfile \"$DJFILE\" -pfile \"$PFILE\" -o \"\$OUTPP/summary.json\" 2>&1 | tee -a \"$LOGFILE_VAL\"; \
+      done; \
+    else \
+      echo \"[run_text_single] Skip evaluation/postprocess: folder not found: \$folder\" | tee -a \"$LOGFILE_VAL\"; \
+    fi; \
+  }; \
   if [ -f \"$OUTFOLD/checkpoint_best.pth\" ]; then \
+    echo \"[run_text_single] Validation (final checkpoint)\" | tee -a \"$LOGFILE_VAL\"; \
+    nnUNetv2_train '$DATASET' '$CONFIG' '$FOLD' -tr '$TRAINER' -p '$PLANS' --val 2>&1 | tee -a \"$LOGFILE_VAL\"; \
+    if [ -d \"$VALFOLDER_BASE\" ]; then \"${PY_GETS}\" - <<'PY' "$VALFOLDER_BASE" "$VALFOLDER_FINAL"; \
+import os, shutil, sys
+src, dst = sys.argv[1:3]
+if os.path.isdir(dst):
+    shutil.rmtree(dst)
+shutil.move(src, dst)
+PY
+    fi; \
+    eval_and_postprocess \"$VALFOLDER_FINAL\" \"validation_final\"; \
+    if [ -f \"$VALFOLDER_FINAL/summary.json\" ]; then mv \"$VALFOLDER_FINAL/summary.json\" \"$VALFOLDER_FINAL/summary_last.json\"; fi; \
+    echo \"[run_text_single] Validation (best checkpoint: $OUTFOLD/checkpoint_best.pth)\" | tee -a \"$LOGFILE_VAL\"; \
     nnUNetv2_train '$DATASET' '$CONFIG' '$FOLD' -tr '$TRAINER' -p '$PLANS' --val --val_best 2>&1 | tee -a \"$LOGFILE_VAL\"; \
+    if [ -d \"$VALFOLDER_BASE\" ]; then \"${PY_GETS}\" - <<'PY' "$VALFOLDER_BASE" "$VALFOLDER_BEST"; \
+import os, shutil, sys
+src, dst = sys.argv[1:3]
+if os.path.isdir(dst):
+    shutil.rmtree(dst)
+shutil.move(src, dst)
+PY
+    fi; \
+    eval_and_postprocess \"$VALFOLDER_BEST\" \"validation_best\"; \
+    if [ -f \"$VALFOLDER_BEST/summary.json\" ]; then mv \"$VALFOLDER_BEST/summary.json\" \"$VALFOLDER_BEST/summary_best.json\"; fi; \
   else \
     echo \"[run_text_single] Skip validation: no checkpoint_best.pth yet in $OUTFOLD\" | tee -a \"$LOGFILE_VAL\"; \
-  fi; \
-  if [ -d \"$VALFOLDER\" ]; then \
-    nnUNetv2_evaluate_folder \"$GTFOLDER\" \"$VALFOLDER\" -djfile \"$DJFILE\" -pfile \"$PFILE\" -o \"$VALFOLDER/summary.json\" 2>&1 | tee -a \"$LOGFILE_VAL\"; \
-    for MV in $SWEEP_LIST; do \
-      OUTPP=\"${VALFOLDER}_pp_min\${MV}\"; \
-      if [ \"$KEEP_LARGEST\" = \"1\" ]; then OUTPP=\"\${OUTPP}_lcc\"; fi; \
-      mkdir -p \"\$OUTPP\"; \
-      EXTRA_ARG=''; \
-      if [ \"$KEEP_LARGEST\" = \"1\" ]; then EXTRA_ARG='--keep-largest'; fi; \
-      "${PY_GETS}" tools/postprocess_cc.py --in \"$VALFOLDER\" --out \"\$OUTPP\" --labels 1 --min-voxels \"\${MV}\" \$EXTRA_ARG; \
-      nnUNetv2_evaluate_folder \"$GTFOLDER\" \"\$OUTPP\" -djfile \"$DJFILE\" -pfile \"$PFILE\" -o \"\$OUTPP/summary.json\" 2>&1 | tee -a \"$LOGFILE_VAL\"; \
-    done; \
-  else \
-    echo \"[run_text_single] Skip evaluation/postprocess: validation folder not found: $VALFOLDER\" | tee -a \"$LOGFILE_VAL\"; \
   fi"
 
 # Always run in foreground so logs stream to terminal and Ctrl+C works

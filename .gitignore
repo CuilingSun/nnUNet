@@ -122,14 +122,17 @@ out_heatmap_grid_gate/
 # Training logs (do not commit)
 log/
 
-# Codex CLI artifacts
-.codex_write_test
-.ro_test
-session.task
-
 # Pretrained weights
 pretrained/
 
 # local env backups / conda temp
 nnunetv2_env_backup_*.yml
 condarc_tmp.yml
+
+# results folders
+pred/
+val_results/
+
+\promptbank_vectors
+\similarity_map
+\quick_search
