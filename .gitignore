@@ -133,6 +133,16 @@ condarc_tmp.yml
 pred/
 val_results/
 
-\promptbank_vectors
-\similarity_map
-\quick_search
+promptbank_vectors/
+similarity_map/
+/quick_search
+
+tools/run_moe_text_tversky.sh
+tools/run_moe_text_cross_attn.sh
+
+nnunetv2/nets/MultiEncodernnUNet.py
+nnunetv2/training/nnUNetTrainer/nnUNetTrainerMultiEncodernnUNet.py
+nnunetv2/training/nnUNetTrainer/nnUNetTrainerMultiEncodernnUNetText.py
+nnunetv2/nets/MoEAdapterUNet.py
+nnunetv2/training/nnUNetTrainer/nnUNetTrainerMoEAdapterUNet.py
+nnunetv2/training/nnUNetTrainer/nnUNetTrainerMoEAdapterUNetText.py
